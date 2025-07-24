@@ -10,11 +10,13 @@ jobs:
       id-token: "write"
       contents: "read"
     steps:
-      - uses: "actions/checkout@v4"
-      - uses: "DeterminateSystems/determinate-nix-action@v3"
-      - uses: "DeterminateSystems/flakehub-push@main"
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/flakehub-cache-action@main
+      - uses: DeterminateSystems/flake-checker-action@main
+      - uses: DeterminateSystems/flakehub-push@main
         with:
-          name: "ramblurr/spdx-util"
+          name: ramblurr/spdx-util
           rolling: true
           visibility: "public"
           include-output-paths: true
