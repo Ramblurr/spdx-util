@@ -18,9 +18,39 @@
 
 ## Installation
 
-Ensure you have [Babashka][bb] installed, then make the script executable:
+### Using nix
+
+``` bash
+# Run directly
+$ nix run github:ramblurr/spdx-util
+spdx - A tool for managing licenses in your project
+
+Usage: spdx <command> [options]
+
+Commands:
+  init <SPDX-ID>  Initialize a LICENSE file with the specified SPDX identifier
+  check           Check for missing license headers in source files
+  fix             Fix missing license headers in source files
+
+Run 'spdx <command> --help' for more information on a command.
+```
+
+Add to your flake:
+
+``` nix
+{
+  inputs.spdx-util.url = "https://flakehub.com/f/ramblurr/spdx-util/0.1.4";
+  outputs = { self, spdx-util }: {
+    # use the package: spdx-util-packages.x86_64-linux.default
+  };
+```
+
+### Manual
+
+Ensure you have [Babashka][bb] installed, then download and make the script executable:
 
 ```bash
+wget https://github.com/Ramblurr/spdx-util/raw/refs/heads/main/spdx
 chmod +x spdx
 ```
 
