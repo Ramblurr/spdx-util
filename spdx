@@ -1,0 +1,648 @@
+#!/usr/bin/env bb
+(require '[babashka.http-client :as http]
+         '[cheshire.core :as json]
+         '[babashka.process :refer [shell]]
+         '[clojure.java.io :as io]
+         '[babashka.fs :as fs]
+         '[babashka.cli :as cli]
+         '[clojure.string :as str])
+
+(defn get-git-config [key]
+  (try
+    (-> (shell {:out :string} "git" "config" "get" key)
+        :out
+        str/trim)
+    (catch Exception _ "")))
+
+(defn get-git-remote-url []
+  (try
+    (let [url (-> (shell {:out :string} "git" "remote" "get-url" "origin")
+                  :out
+                  str/trim)]
+      (if (str/ends-with? url ".git")
+        (subs url 0 (- (count url) 4))
+        url))
+    (catch Exception _ nil)))
+
+(defn get-cache-paths []
+  (let [cache-home (fs/xdg-cache-home)]
+    (when (and cache-home (not (str/blank? (str cache-home))))
+      {:cache-dir (fs/path cache-home "spdx")
+       :cache-file (fs/path cache-home "spdx" "licenses.json")})))
+
+(defn read-licenses-from-file [file-path]
+  (-> file-path
+      str
+      slurp
+      (json/parse-string true)))
+
+(defn fetch-licenses-from-network []
+  (-> (http/get "https://raw.githubusercontent.com/spdx/license-list-data/main/json/licenses.json")
+      :body
+      (json/parse-string true)))
+
+(defn write-to-cache [cache-paths data]
+  (when cache-paths
+    (try
+      (fs/create-dirs (:cache-dir cache-paths))
+      (spit (str (:cache-file cache-paths)) (json/generate-string data))
+      (catch Exception _
+        ;; Ignore cache write errors
+        nil))))
+
+(defn read-from-cache [cache-paths]
+  (when (and cache-paths (fs/exists? (:cache-file cache-paths)))
+    (try
+      (read-licenses-from-file (:cache-file cache-paths))
+      (catch Exception _
+        nil))))
+
+(defn fetch-licenses-json []
+  (if-let [local-path (System/getenv "SPDX_LICENSES_PATH")]
+    (read-licenses-from-file (io/file local-path "licenses.json"))
+    (let [cache-paths (get-cache-paths)
+          cached-data (read-from-cache cache-paths)]
+      (or cached-data
+          (let [data (fetch-licenses-from-network)]
+            (write-to-cache cache-paths data)
+            data)))))
+
+(defn find-license [spdx-id licenses]
+  (->> (:licenses licenses)
+       (filter #(= (:licenseId %) spdx-id))
+       first))
+
+(defn fetch-license-text [detail-url]
+  (let [response (http/get detail-url)
+        data (json/parse-string (:body response) true)]
+    (:licenseText data)))
+
+(def comment-syntax
+  {"clj" ";;"
+   "cljs" ";;"
+   "cljc" ";;"
+   "cljx" ";;"
+   "bb" ";;"
+   "edn" ";;"
+   "el" ";;"
+   "lisp" ";;"
+   "cl" ";;"
+   "lsp" ";;"
+   "l" ";;"
+   "scm" ";;"
+   "ss" ";;"
+   "rkt" ";;"
+   "fnl" ";;"
+   "hy" ";;"
+   "arc" ";;"
+   "nu" ";;"
+   "janet" ";;"
+   "js" "//"
+   "jsx" "//"
+   "ts" "//"
+   "tsx" "//"
+   "java" "//"
+   "c" "//"
+   "cpp" "//"
+   "cc" "//"
+   "h" "//"
+   "hpp" "//"
+   "cs" "//"
+   "go" "//"
+   "rs" "//"
+   "py" "#"
+   "rb" "#"
+   "sh" "#"
+   "bash" "#"
+   "zsh" "#"
+   "fish" "#"
+   "yml" "#"
+   "yaml" "#"
+   "toml" "#"
+   "ini" "#"
+   "conf" "#"
+   "R" "#"
+   "r" "#"
+   "pl" "#"
+   "lua" "--"
+   "sql" "--"
+   "hs" "--"
+   "elm" "--"
+   "purs" "--"})
+
+(defn find-project-root
+  "Recurses up from `start-path` looking for the first `flake.nix` or `.git` and returns its parent directory."
+  ([]
+   (find-project-root (fs/cwd)))
+  ([start-path]
+   (loop [current (fs/absolutize start-path)]
+     (cond
+       (nil? (fs/parent current))
+       nil
+
+       (or (fs/exists? (fs/path current "flake.nix"))
+           (fs/exists? (fs/path current ".git")))
+       current
+
+       :else
+       (recur (fs/parent current))))))
+
+(defn derive-spdx-id
+  "Extracts SPDX-License-Identifier from LICENSE.spdx file"
+  [search-dir]
+  (let [spdx-file (fs/path search-dir "LICENSE.spdx")]
+    (when (fs/exists? spdx-file)
+      (let [content (slurp (str spdx-file))]
+        (when-let [[_ spdx-id] (re-find #"PackageLicenseDeclared:\s*(\S+)" content)]
+          spdx-id)))))
+
+(defn derive-copyright
+  "Extracts copyright from LICENSE.spdx file"
+  [search-dir]
+  (let [spdx-file (fs/path search-dir "LICENSE.spdx")]
+    (when (fs/exists? spdx-file)
+      (let [content (slurp (str spdx-file))]
+        (when-let [[_ copyright] (re-find #"PackageOriginator:\s*(.+)" content)]
+          (str/trim copyright))))))
+
+(defn build-copyright-string
+  "Pure function to build copyright string from name and email"
+  [{:keys [name email]}]
+  (str name " <" email ">"))
+
+(defn matches-pattern?
+  "Check if path matches a gitignore-style pattern"
+  [path pattern]
+  (let [pattern (str/trim pattern)]
+    (cond
+      ;; Empty or comment line
+      (or (str/blank? pattern) (str/starts-with? pattern "#"))
+      false
+
+      ;; Directory pattern (ends with /)
+      (str/ends-with? pattern "/")
+      (str/includes? path (subs pattern 0 (dec (count pattern))))
+
+      ;; Glob pattern
+      (or (str/includes? pattern "*") (str/includes? pattern "?"))
+      (let [regex-pattern (-> pattern
+                              (str/replace "." "\\.")
+                              (str/replace "*" ".*")
+                              (str/replace "?" ".")
+                              (str "$"))] ; Add end anchor for exact matching
+        (re-find (re-pattern regex-pattern) path))
+
+      ;; Exact match
+      :else
+      (= path pattern))))
+
+(defn read-gitignore
+  "Read .gitignore file and return patterns"
+  [dir]
+  (let [gitignore-file (fs/path dir ".gitignore")]
+    (if (fs/exists? gitignore-file)
+      (->> (slurp (str gitignore-file))
+           str/split-lines
+           (map str/trim)
+           (remove #(or (str/blank? %) (str/starts-with? % "#")))
+           vec)
+      [])))
+
+(defn path-ignored?
+  "Check if path should be ignored based on patterns"
+  [path base-dir patterns]
+  (let [rel-path (str (fs/relativize base-dir path))
+        gitignore-patterns (read-gitignore base-dir)
+        all-patterns (concat gitignore-patterns patterns)]
+    (some #(matches-pattern? rel-path %) all-patterns)))
+
+(defn get-copyright-default
+  "Gets copyright info with fallback: LICENSE.spdx -> git config -> error"
+  [project-root current-dir]
+  (or
+   ;; First try LICENSE.spdx in project root
+   (when project-root (derive-copyright project-root))
+   ;; Then try LICENSE.spdx in current dir if different
+   (when (not= project-root current-dir) (derive-copyright current-dir))
+   ;; Then try git config
+   (let [name (get-git-config "user.name")
+         email (get-git-config "user.email")]
+     (when (and (seq name) (seq email))
+       (build-copyright-string {:name name :email email})))
+   ;; Otherwise will need to be specified
+   nil))
+
+(defn get-spdx-default
+  "Gets SPDX ID with fallback: LICENSE.spdx in project root -> current dir -> error"
+  [project-root current-dir]
+  (or
+   ;; First try LICENSE.spdx in project root
+   (when project-root (derive-spdx-id project-root))
+   ;; Then try LICENSE.spdx in current dir if different
+   (when (not= project-root current-dir) (derive-spdx-id current-dir))
+   ;; Otherwise will need to be specified
+   nil))
+
+(defn get-current-year []
+  (str (.getValue (java.time.Year/now))))
+
+(defn generate-license-header
+  "Generate license header with appropriate comment syntax"
+  [{:keys [copyright year spdx-id extension]}]
+  (let [comment-char (get comment-syntax extension ";;")]
+    (str comment-char " Copyright © " year " " copyright "\n"
+         comment-char " SPDX-License-Identifier: " spdx-id "\n")))
+
+(defn has-shebang? [content]
+  (str/starts-with? content "#!"))
+
+(defn extract-header-lines
+  "Extract potential header lines, accounting for shebang"
+  [content]
+  (let [lines (str/split-lines content)
+        start-idx (if (and (seq lines) (has-shebang? (first lines))) 1 0)]
+    (when (>= (count lines) (+ start-idx 2))
+      [(nth lines start-idx)
+       (nth lines (inc start-idx))])))
+
+(defn file-has-license-header?
+  "Check if file already has the expected license header"
+  [file-path copyright year spdx-id extension]
+  (try
+    (let [content (slurp file-path)
+          expected-header (generate-license-header {:copyright copyright
+                                                    :year year
+                                                    :spdx-id spdx-id
+                                                    :extension extension})
+          expected-lines (str/split-lines expected-header)
+          actual-lines (extract-header-lines content)]
+      (= expected-lines actual-lines))
+    (catch Exception _ false)))
+
+(defn replace-or-add-header
+  "Replace existing header or add new one, preserving shebang and other content"
+  [content new-header extension]
+  (let [lines (str/split-lines content)
+        comment-char (get comment-syntax extension ";;")
+        has-shebang (and (seq lines) (has-shebang? (first lines)))
+        start-idx (if has-shebang 1 0)]
+    (if (< (count lines) start-idx)
+      ;; File is empty or only has shebang
+      (if has-shebang
+        (str (first lines) "\n" new-header)
+        new-header)
+      ;; Check if we have an existing copyright header to replace
+      (let [line1 (when (< start-idx (count lines)) (nth lines start-idx))
+            line2 (when (< (inc start-idx) (count lines)) (nth lines (inc start-idx)))
+            has-copyright-header (and line1 line2
+                                      (str/includes? line1 "Copyright")
+                                      (str/includes? line1 comment-char)
+                                      (str/includes? line2 "SPDX-License-Identifier")
+                                      (str/includes? line2 comment-char))]
+        (if has-copyright-header
+          ;; Replace existing header
+          (let [prefix-lines (take start-idx lines)
+                suffix-lines (drop (+ start-idx 2) lines)]
+            (str/join "\n" (concat prefix-lines
+                                   (str/split-lines new-header)
+                                   suffix-lines)))
+          ;; Add new header
+          (let [prefix-lines (take start-idx lines)
+                suffix-lines (drop start-idx lines)]
+            (str/join "\n" (concat prefix-lines
+                                   (str/split-lines new-header)
+                                   suffix-lines))))))))
+
+(defn get-file-extension [file-path]
+  (let [name (fs/file-name file-path)
+        idx (str/last-index-of name ".")]
+    (when (and idx (< idx (dec (count name))))
+      (subs name (inc idx)))))
+
+(defn should-process-file?
+  "Check if file should be processed based on extensions and ignore patterns"
+  [file-path config already-has-header]
+  (and (not (fs/directory? file-path))
+       (let [ext (get-file-extension file-path)]
+         (contains? (set (:extensions config)) ext))
+       (not (path-ignored? file-path (:cwd config) (:exclude config)))
+       (not already-has-header)))
+
+(defn get-target-files
+  "Get all files that need license headers"
+  [config]
+  (let [{:keys [target-paths extensions copyright year spdx-id cwd]} config]
+    (->> target-paths
+         (mapcat (fn [path]
+                   (if (fs/directory? path)
+                    ;; Use glob to find all files recursively
+                     (->> extensions
+                          (mapcat (fn [ext]
+                                    (fs/glob path (str "**." ext))))
+                          (map str))
+                     [(str path)])))
+         (filter (fn [path]
+                   (let [ext (get-file-extension path)]
+                     (and (not (fs/directory? path))
+                          (contains? (set extensions) ext)
+                          (not (path-ignored? path cwd (:exclude config)))
+                          (not (file-has-license-header? path copyright year spdx-id ext)))))))))
+
+(defn process-file!
+  "Process a single file - check or fix license header. Returns {:file path :needs-header boolean :modified boolean}"
+  [file-path config mode]
+  (let [{:keys [copyright year spdx-id]} config
+        ext (get-file-extension file-path)]
+    (try
+      (let [already-has-header (file-has-license-header? file-path copyright year spdx-id ext)]
+        (if already-has-header
+          {:file file-path :needs-header false :modified false}
+          (if (= mode :check)
+            (do
+              (println (str "Missing header: " file-path))
+              {:file file-path :needs-header true :modified false})
+            (let [content (slurp file-path)
+                  header (generate-license-header {:copyright copyright
+                                                   :year year
+                                                   :spdx-id spdx-id
+                                                   :extension ext})
+                  new-content (replace-or-add-header content header ext)]
+              (spit file-path new-content)
+              (println (str "Fixed: " file-path))
+              {:file file-path :needs-header true :modified true}))))
+      (catch Exception e
+        (binding [*out* *err*]
+          (println (str "Error processing " file-path ": " (.getMessage e))))
+        {:file file-path :needs-header false :modified false :error true}))))
+
+(defn process-files!
+  "Process multiple files - check or fix license headers. Returns summary map."
+  [config mode]
+  (let [target-files (get-target-files config)
+        file-count (count target-files)]
+    (if (zero? file-count)
+      {:total 0 :needs-header 0 :modified 0 :errors 0}
+      (let [results (mapv #(process-file! % config mode) target-files)
+            needs-header (count (filter :needs-header results))
+            modified (count (filter :modified results))
+            errors (count (filter :error results))]
+        {:total file-count
+         :needs-header needs-header
+         :modified modified
+         :errors errors
+         :results results}))))
+
+(def common-spec
+  {:spdx-id {:desc "SPDX license identifier (auto-detected from LICENSE.spdx if not provided)"
+             :ref "<spdx-id>"
+             :alias :s}
+   :copyright {:desc "Copyright holder info (auto-detected if not provided)"
+               :ref "<copyright>"
+               :alias :C}
+   :year {:desc "Copyright year"
+          :ref "<year>"
+          :default-desc "current year"
+          :alias :y}
+   :exclude {:desc "File patterns to exclude (gitignore syntax, can be repeated)"
+             :ref "<pattern>"
+             :coerce []
+             :alias :e}
+   :extension {:desc "File extensions to process (can be repeated)"
+               :ref "<ext>"
+               :coerce []
+               :default ["clj" "cljc" "cljs"]
+               :default-desc "clj, cljc, cljs"
+               :alias :x}
+   :help {:desc "Show help message"
+          :coerce :boolean
+          :alias :h}})
+
+(defn fix [{:keys [opts args]}]
+  (let [{:keys [spdx-id copyright year exclude extension help]} opts
+        target-paths (or (seq args) [(fs/cwd)])]
+
+    (when help
+      (println "Usage: spdx fix [files/directories...] [options]")
+      (println)
+      (println "Fix missing license headers in source files")
+      (println)
+      (println "Arguments:")
+      (println "  files/directories  Files or directories to process (default: current directory)")
+      (println)
+      (println "Options:")
+      (println (cli/format-opts {:spec common-spec :order [:spdx-id :copyright :year :exclude :extension :help]}))
+      (System/exit 0))
+
+    (let [current-dir (fs/cwd)
+          project-root (find-project-root)
+          cwd (or project-root current-dir)
+
+          ;; Resolve defaults
+          spdx-id (or spdx-id (get-spdx-default project-root current-dir))
+          copyright (or copyright (get-copyright-default project-root current-dir))
+          year (or year (get-current-year))
+          extensions (set (or (seq extension) ["clj" "cljc" "cljs"]))]
+
+      (when-not spdx-id
+        (binding [*out* *err*]
+          (println "Error: SPDX ID not found. Specify with --spdx-id or create LICENSE.spdx"))
+        (System/exit 1))
+
+      (when-not copyright
+        (binding [*out* *err*]
+          (println "Error: Copyright holder not found. Specify with --copyright, LICENSE.spdx, or configure git user"))
+        (System/exit 1))
+
+      (let [config {:spdx-id spdx-id
+                    :copyright copyright
+                    :year year
+                    :exclude exclude
+                    :extensions extensions
+                    :target-paths (map fs/absolutize target-paths)
+                    :cwd cwd}
+
+            ;; Process files
+            summary (process-files! config :fix)]
+
+        (println)
+        (println (str "Modified " (:modified summary) " file(s)."))
+        (when (pos? (:errors summary))
+          (println (str "Errors: " (:errors summary))))
+        (System/exit 0)))))
+
+(defn check [{:keys [opts args]}]
+  (let [{:keys [spdx-id copyright year exclude extension help]} opts
+        target-paths (or (seq args) [(fs/cwd)])]
+
+    (when help
+      (println "Usage: spdx check [files/directories...] [options]")
+      (println)
+      (println "Check for missing license headers in source files")
+      (println)
+      (println "Arguments:")
+      (println "  files/directories  Files or directories to check (default: current directory)")
+      (println)
+      (println "Options:")
+      (println (cli/format-opts {:spec common-spec :order [:spdx-id :copyright :year :exclude :extension :help]}))
+      (System/exit 0))
+
+    (let [current-dir (fs/cwd)
+          project-root (find-project-root)
+          cwd (or project-root current-dir)
+
+          ;; Resolve defaults
+          spdx-id (or spdx-id (get-spdx-default project-root current-dir))
+          copyright (or copyright (get-copyright-default project-root current-dir))
+          year (or year (get-current-year))
+          extensions (set (or (seq extension) ["clj" "cljc" "cljs"]))]
+
+      (when-not spdx-id
+        (binding [*out* *err*]
+          (println "Error: SPDX ID not found. Specify with --spdx-id or create LICENSE.spdx"))
+        (System/exit 1))
+
+      (when-not copyright
+        (binding [*out* *err*]
+          (println "Error: Copyright holder not found. Specify with --copyright, LICENSE.spdx, or configure git user"))
+        (System/exit 1))
+
+      (let [config {:spdx-id spdx-id
+                    :copyright copyright
+                    :year year
+                    :exclude exclude
+                    :extensions extensions
+                    :target-paths (map fs/absolutize target-paths)
+                    :cwd cwd}
+
+            ;; Check files
+            summary (process-files! config :check)]
+
+        (println)
+        (if (zero? (:needs-header summary))
+          (do
+            (println "All files have license headers.")
+            (System/exit 0))
+          (do
+            (println (str "Files missing headers: " (:needs-header summary)))
+            (when (pos? (:errors summary))
+              (println (str "Errors: " (:errors summary))))
+            (System/exit 1)))))))
+
+(def spec
+  {:copyright {:desc "Override copyright name and email"
+               :ref "<name-email>"}
+   :year {:desc "Override copyright year"
+          :ref "<year>"
+          :default-desc "current year"}
+   :help {:desc "Show help message"
+          :coerce :boolean
+          :alias :h}})
+
+(defn process-license-text
+  "Pure function to replace placeholders in license text"
+  [{:keys [license-text year-str copyright-str]}]
+  (-> license-text
+      (str/replace #"<year>" year-str)
+      (str/replace #"<YEAR>" year-str)
+      (str/replace #"<copyright holders?>" copyright-str)
+      (str/replace #"<COPYRIGHT HOLDERS?>" copyright-str)))
+
+(defn generate-spdx-content
+  "Pure function to generate SPDX metadata content"
+  [{:keys [package-name copyright-str homepage spdx-id]}]
+  (str "SPDXVersion: SPDX-2.1\n"
+       "DataLicense: CC0-1.0\n"
+       "PackageName: " package-name "\n"
+       "PackageOriginator: " copyright-str "\n"
+       (when homepage
+         (str "PackageHomePage: " homepage "\n"))
+       "PackageLicenseDeclared: " spdx-id "\n"))
+
+(defn generate-markdown-snippet
+  "Pure function to generate markdown license snippet"
+  [{:keys [license-name year-str copyright-str spdx-id]}]
+  (str "## License: " license-name "\n\n"
+       "Copyright © " year-str " " copyright-str "\n"
+       "Distributed under the [" spdx-id "](https://spdx.org/licenses/" spdx-id ".html)."))
+
+(defn init [{:keys [args opts]}]
+  (let [{:keys [copyright year help]} opts
+        spdx-id (first args)]
+
+    (when (or help (nil? spdx-id))
+      (println "Usage: spdx init <SPDX-ID> [options]")
+      (println)
+      (println "Initialize a LICENSE file with the specified SPDX identifier")
+      (println)
+      (println "Arguments:")
+      (println "  SPDX-ID  SPDX license identifier (e.g., MIT, Apache-2.0)")
+      (println)
+      (println "Options:")
+      (println (cli/format-opts {:spec spec :order [:copyright :year :help]}))
+      (System/exit 0))
+
+    (let [licenses (fetch-licenses-json)
+          license-info (find-license spdx-id licenses)]
+
+      (when-not license-info
+        (println (str "Error: License '" spdx-id "' not found in SPDX license list"))
+        (System/exit 1))
+
+      (let [license-text (fetch-license-text (:detailsUrl license-info))
+            default-name (get-git-config "user.name")
+            default-email (get-git-config "user.email")
+            copyright-str (or copyright (build-copyright-string {:name default-name :email default-email}))
+            year-str (str (or year (.getYear (java.time.LocalDate/now))))
+            license-name (:name license-info)
+            package-name (fs/file-name (fs/cwd))
+            homepage (get-git-remote-url)
+
+            processed-text (process-license-text {:license-text license-text
+                                                  :year-str year-str
+                                                  :copyright-str copyright-str})
+            spdx-content (generate-spdx-content {:package-name package-name
+                                                 :copyright-str copyright-str
+                                                 :homepage homepage
+                                                 :spdx-id spdx-id})
+            markdown-snippet (generate-markdown-snippet {:license-name license-name
+                                                         :year-str year-str
+                                                         :copyright-str copyright-str
+                                                         :spdx-id spdx-id})]
+
+        (spit "LICENSE" processed-text)
+        (println "Written license to LICENSE")
+
+        (spit "LICENSE.spdx" spdx-content)
+        (println "Written SPDX metadata to LICENSE.spdx")
+
+        (println)
+        (println markdown-snippet)))))
+
+(defn help [_]
+  (println "spdx - A tool for managing licenses in your project")
+  (println)
+  (println "Usage: spdx <command> [options]")
+  (println)
+  (println "Commands:")
+  (println "  init <SPDX-ID>  Initialize a LICENSE file with the specified SPDX identifier")
+  (println "  check           Check for missing license headers in source files")
+  (println "  fix             Fix missing license headers in source files")
+  (println)
+  (println "Run 'spdx <command> --help' for more information on a command."))
+
+(def table
+  [{:cmds ["init"] :fn init
+    :spec spec
+    :desc "Initialize a LICENSE file with the specified SPDX identifier"}
+   {:cmds ["check"] :fn check
+    :spec common-spec
+    :desc "Check for missing license headers in source files"}
+   {:cmds ["fix"] :fn fix
+    :spec common-spec
+    :desc "Fix missing license headers in source files"}
+   {:cmds [] :fn help}])
+
+(defn -main [& args]
+  (cli/dispatch table args))
+
+(apply -main *command-line-args*)
