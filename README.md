@@ -134,6 +134,39 @@ spdx fix --exclude "target/*" --exclude "*.generated.clj"
 spdx fix --copyright "ACME Corp" --year 2024
 ```
 
+## Pre-commit Integration
+
+You can use `spdx` as a [pre-commit](https://pre-commit.com/) hook to automatically check for missing license headers:
+
+1. Ensure you have [Babashka][bb] installed on your system (pre-commit won't install it automatically)
+
+2. Add this to your `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/ramblurr/spdx-util
+    rev: main
+    hooks:
+      - id: spdx
+        args: [check]
+        # Optional: specify file extensions to check
+        # args: [check, --extension, py, --extension, js]
+```
+
+3. Install the pre-commit hook:
+
+```bash
+pre-commit install
+```
+
+Now the hook will run automatically before each commit, failing if any files are missing license headers.
+
+To run the hook manually:
+
+```bash
+pre-commit run spdx --all-files
+```
+
 ## Configuration
 
 The tool automatically detects configuration from your project:
