@@ -1,0 +1,7 @@
+- id: spdx
+  name: SPDX License Header Check
+  description: Checks for missing SPDX license headers in source files
+  entry: ./spdx check
+  language: system
+  pass_filenames: false
+  always_run: true
