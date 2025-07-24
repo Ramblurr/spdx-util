@@ -1,4 +1,6 @@
 #!/usr/bin/env bb
+;; Copyright © 2025 Casey Link <casey@outskirtslabs.com>
+;; SPDX-License-Identifier: EUPL-1.2
 (require '[babashka.http-client :as http]
          '[cheshire.core :as json]
          '[babashka.process :refer [shell]]

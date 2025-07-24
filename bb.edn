@@ -1,0 +1,20 @@
+{:paths []
+ :tasks {:requires ([clojure.string :as str]
+                    [babashka.tasks :refer [shell]])
+         dev       {:requires ([babashka.fs :as fs]
+                               [babashka.nrepl.server :as srv])
+                    :task     (let [port (with-open [s (java.net.ServerSocket. 0)]
+                                           (.getLocalPort s))]
+                                (srv/start-server! {:host "localhost" :port port})
+                                (spit ".nrepl-port" (str port))
+                                (fs/delete-on-exit ".nrepl-port")
+                                (deref (promise)))}
+         test              (println "No test suite in this project yet.")
+         fmt               (shell "cljfmt -v fix .")
+         lint.copy-configs (let [cp (-> (shell {:out :string} "clojure -Spath -M:test:dev") :out str/trim)]
+                             (shell (str "clj-kondo --lint " cp " --dependencies --copy-configs --skip-lint")))
+         lint.kondo        (shell "clj-kondo" *command-line-args*)
+         lint              (shell (str "clj-kondo" " --fail-level error"
+                                       (if (seq *command-line-args*)
+                                         (str " --lint " (first *command-line-args*))
+                                         " --lint .")))}}
