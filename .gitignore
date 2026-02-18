@@ -4,5 +4,7 @@
 .idea
 *.log
 tmp/
-
-
+*.md
+.clj-kondo/
+!.clj-kondo/config.edn
+.lsp

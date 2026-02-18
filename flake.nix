@@ -2,15 +2,24 @@
   description = "A slightly opinionated cli tool for managing SPDX licenses and copyright headers in your projects ";
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1"; # tracks nixpkgs unstable branch
-    flakelight.url = "github:nix-community/flakelight";
+    devshell.url = "github:numtide/devshell";
+    devshell.inputs.nixpkgs.follows = "nixpkgs";
+    devenv.url = "https://flakehub.com/f/ramblurr/nix-devenv/*";
+    devenv.inputs.nixpkgs.follows = "nixpkgs";
   };
   outputs =
-    {
+    inputs@{
       self,
-      flakelight,
+      devenv,
+      devshell,
       ...
     }:
-    flakelight ./. {
+    devenv.lib.mkFlake ./. {
+      inherit inputs;
+      withOverlays = [
+        devshell.overlays.default
+        devenv.overlays.default
+      ];
       package =
         pkgs:
         pkgs.writeShellApplication (
@@ -20,11 +29,11 @@
           {
             name = "spdx";
             runtimeInputs = [
-              pkgs.babashka
+              pkgs.babashka-unwrapped
               pkgs.git
             ];
             text = ''
-              exec ${pkgs.babashka}/bin/bb ${script} $@
+              exec ${pkgs.babashka-unwrapped}/bin/bb ${script} "$@"
             '';
             checkPhase = ''
               ${pkgs.clj-kondo}/bin/clj-kondo --config '{:linters {:namespace-name-mismatch {:level :off}}}' --lint ${script}
@@ -37,18 +46,27 @@
         type = "app";
         program = "${self.packages.${pkgs.system}.default}/bin/spdx";
       };
-      devShell.packages =
-        pkgs: with pkgs; [
-          clj-kondo
-          babashka
-          git
-          self.packages.${pkgs.system}.default
-        ];
 
-      flakelight.builtinFormatters = false;
-      formatters = pkgs: {
-        "*.nix" = "${pkgs.nixfmt}/bin/nixfmt";
-        "*.clj" = "${pkgs.cljfmt}/bin/cljfmt fix";
+      devShell =
+        pkgs:
+        pkgs.devshell.mkShell {
+          imports = [
+            devenv.capsules.base
+            devenv.capsules.clojure
+          ];
+          packages = [
+            pkgs.clj-kondo
+            pkgs.babashka-unwrapped
+            pkgs.git
+            self.packages.${pkgs.system}.default
+          ];
+        };
+
+      treefmtConfig = {
+        programs = {
+          nixfmt.enable = true;
+          cljfmt.enable = true;
+        };
       };
     };
 }
