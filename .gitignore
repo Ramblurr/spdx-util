@@ -8,3 +8,4 @@ tmp/
 .clj-kondo/
 !.clj-kondo/config.edn
 .lsp
+.direnv/
